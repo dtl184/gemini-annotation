@@ -4,6 +4,7 @@ downloaded itself via the Annotator API - never the dataset in place."""
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -48,4 +49,32 @@ def trim_clip(src: Path, start: float, end: float, dest: Path, *, keep_audio: bo
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise FfmpegError(f"ffmpeg failed trimming {src} [{start}, {end}]: {result.stderr[-2000:]}")
+    return dest
+
+
+def concat_videos(paths: list[Path], dest: Path) -> Path:
+    """Losslessly stitch several mp4s (in order) into one, via ffmpeg's concat
+    demuxer (`-c copy` - no re-encode). Only valid when the inputs share
+    codec/parameters, which LeRobot v3's per-view file splitting guarantees:
+    a view's files are the same recording cut by size, not by re-encoding.
+    """
+    if not paths:
+        raise FfmpegError("concat_videos called with no inputs")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if len(paths) == 1:
+        import shutil
+        shutil.copy2(paths[0], dest)
+        return dest
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        for p in paths:
+            f.write(f"file '{p.resolve()}'\n")
+        list_path = Path(f.name)
+    try:
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy", str(dest)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise FfmpegError(f"ffmpeg failed concatenating {len(paths)} files: {result.stderr[-2000:]}")
+    finally:
+        list_path.unlink(missing_ok=True)
     return dest

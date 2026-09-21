@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-DEFAULT_MODEL = "gemini-2.5-pro"
+# gemini-2.5-pro was retired for new API keys shortly after this pipeline was
+# first written; the API's own 404 pointed at this replacement.
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_ANNOTATOR_URL = "http://127.0.0.1:5111"
 
 

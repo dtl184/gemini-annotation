@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from gemini_annotator.schema import apply_elaboration, parse_segmentation
+from gemini_annotator.schema import (
+    apply_elaboration,
+    apply_window_elaboration,
+    parse_segmentation,
+    parse_window_segmentation,
+)
 
 
 def test_parse_segmentation_happy_path():
@@ -94,3 +99,78 @@ def test_apply_elaboration_clears_recovery_fields_when_not_recovery():
                                             "recovery_from": "should be ignored", "recovery_action": "should be ignored"}]})
     assert chunks[0].recovery_from is None
     assert chunks[0].recovery_action is None
+
+
+def test_parse_window_segmentation_shifts_times_onto_global_axis():
+    data = {
+        "episodes": [
+            {
+                "start_sec": 0.0, "end_sec": 30.0, "overall_task": "pick up the fork",
+                "chunks": [{"start_sec": 0.0, "end_sec": 30.0, "subtask": "pick up the fork"}],
+            },
+            {
+                "start_sec": 30.0, "end_sec": 60.0, "overall_task": "pick up the carrot",
+                "chunks": [
+                    {"start_sec": 30.0, "end_sec": 45.0, "subtask": "reach for the carrot"},
+                    {"start_sec": 45.0, "end_sec": 60.0, "subtask": "grasp the carrot"},
+                ],
+            },
+        ]
+    }
+    episodes = parse_window_segmentation(data, window_start=100.0, window_end=160.0)
+    assert [e.start_sec for e in episodes] == [100.0, 130.0]
+    assert [e.end_sec for e in episodes] == [130.0, 160.0]
+    assert episodes[1].chunks[0].start_sec == 130.0
+    assert episodes[1].chunks[1].end_sec == 160.0
+    # chunk indices are globally unique within the window (0..N-1 across all episodes)
+    assert [c.index for ep in episodes for c in ep.chunks] == [0, 1, 2]
+
+
+def test_parse_window_segmentation_clamps_to_window_end():
+    data = {"episodes": [{
+        "start_sec": 0.0, "end_sec": 999.0, "overall_task": "task",
+        "chunks": [{"start_sec": 0.0, "end_sec": 999.0, "subtask": "a"}],
+    }]}
+    episodes = parse_window_segmentation(data, window_start=0.0, window_end=50.0)
+    assert episodes[0].end_sec == 50.0
+    assert episodes[0].chunks[0].end_sec == 50.0
+
+
+def test_parse_window_segmentation_drops_degenerate_episodes():
+    data = {"episodes": [
+        {"start_sec": 0.0, "end_sec": 0.0, "overall_task": "degenerate", "chunks": []},
+        {"start_sec": 0.0, "end_sec": 10.0, "overall_task": "real one",
+         "chunks": [{"start_sec": 0.0, "end_sec": 10.0, "subtask": "a"}]},
+    ]}
+    episodes = parse_window_segmentation(data, window_start=0.0, window_end=10.0)
+    assert len(episodes) == 1
+    assert episodes[0].overall_task == "real one"
+
+
+def test_parse_window_segmentation_rejects_no_episodes():
+    with pytest.raises(ValueError):
+        parse_window_segmentation({"episodes": []}, window_start=0.0, window_end=10.0)
+
+
+def test_apply_window_elaboration_merges_across_episodes_by_global_index():
+    data = {
+        "episodes": [
+            {"start_sec": 0.0, "end_sec": 10.0, "overall_task": "task a",
+             "chunks": [{"start_sec": 0.0, "end_sec": 10.0, "subtask": "chunk a"}]},
+            {"start_sec": 10.0, "end_sec": 20.0, "overall_task": "task b",
+             "chunks": [{"start_sec": 10.0, "end_sec": 20.0, "subtask": "chunk b"}]},
+        ]
+    }
+    episodes = parse_window_segmentation(data, window_start=0.0, window_end=20.0)
+    apply_window_elaboration(episodes, {
+        "chunks": [
+            {"index": 0, "atomic_actions": ["x"], "is_recovery": False},
+            {"index": 1, "atomic_actions": ["y"], "is_recovery": True,
+             "recovery_from": "dropped it", "recovery_action": "pick it back up"},
+        ]
+    })
+    assert episodes[0].chunks[0].atomic_actions == ["x"]
+    assert episodes[0].chunks[0].is_recovery is False
+    assert episodes[1].chunks[0].atomic_actions == ["y"]
+    assert episodes[1].chunks[0].is_recovery is True
+    assert episodes[1].chunks[0].recovery_action == "pick it back up"

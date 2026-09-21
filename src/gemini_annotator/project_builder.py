@@ -31,7 +31,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from .schema import EpisodeAnnotation
+from .schema import DetectedEpisode, EpisodeAnnotation
 
 STYLE_MAIN = "main"
 STYLE_SUBTASK = "subtask"
@@ -136,6 +136,70 @@ def apply_episode_annotation(
 
     return {
         "main": 1,
+        "subtask": len(subtask_clips),
+        "atomic": len(atomic_clips),
+        "recovery": len(recovery_clips),
+    }
+
+
+def apply_whole_video_annotation(
+    project: dict[str, Any],
+    episodes: list[DetectedEpisode],
+    *,
+    video_start: float,
+    video_end: float,
+) -> dict[str, int]:
+    """Same four-layer write as apply_episode_annotation, but for whole-video
+    mode: `episodes` are Gemini-DETECTED episodes (see schema.DetectedEpisode)
+    whose chunk times are already on the global axis (parse_window_segmentation
+    shifted them), not episode-local like apply_episode_annotation's input.
+
+    Clears the entire [video_start, video_end) span once - the range that was
+    actually processed - then writes one main clip per detected episode plus
+    its subtask/atomic/recovery clips, rather than replacing per (real, LeRobot
+    metadata) episode. Re-running over the same span is still idempotent.
+    """
+    main_id = _ensure_style(project, STYLE_MAIN)
+    subtask_id = _ensure_style(project, STYLE_SUBTASK)
+    atomic_id = _ensure_style(project, STYLE_ATOMIC)
+    recovery_id = _ensure_style(project, STYLE_RECOVERY)
+
+    main_layer = _ensure_layer(project, main_id)
+    subtask_layer = _ensure_layer(project, subtask_id)
+    atomic_layer = _ensure_layer(project, atomic_id)
+    recovery_layer = _ensure_layer(project, recovery_id)
+
+    main_clips, subtask_clips, atomic_clips, recovery_clips = [], [], [], []
+    for episode in episodes:
+        main_clips.append({
+            "id": _new_id("cl"), "start": episode.start_sec, "end": episode.end_sec,
+            "text": episode.overall_task,
+        })
+        for chunk in episode.chunks:
+            subtask_clips.append({
+                "id": _new_id("cl"), "start": chunk.start_sec, "end": chunk.end_sec, "text": chunk.subtask,
+            })
+            if chunk.atomic_actions:
+                atomic_clips.append({
+                    "id": _new_id("cl"), "start": chunk.start_sec, "end": chunk.end_sec,
+                    "text": "; ".join(chunk.atomic_actions),
+                })
+            if chunk.is_recovery:
+                text = chunk.recovery_action or chunk.recovery_from or chunk.subtask
+                if chunk.recovery_from and chunk.recovery_action:
+                    text = f"{chunk.recovery_action} (recovers from: {chunk.recovery_from})"
+                recovery_clips.append({
+                    "id": _new_id("cl"), "start": chunk.start_sec, "end": chunk.end_sec, "text": text,
+                })
+
+    _replace_range(main_layer, video_start, video_end, main_clips)
+    _replace_range(subtask_layer, video_start, video_end, subtask_clips)
+    _replace_range(atomic_layer, video_start, video_end, atomic_clips)
+    _replace_range(recovery_layer, video_start, video_end, recovery_clips)
+
+    return {
+        "episodes": len(episodes),
+        "main": len(main_clips),
         "subtask": len(subtask_clips),
         "atomic": len(atomic_clips),
         "recovery": len(recovery_clips),

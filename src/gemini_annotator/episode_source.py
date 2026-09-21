@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .annotator_client import AnnotatorClient
-from .ffmpeg_utils import probe_duration, trim_clip
+from .ffmpeg_utils import concat_videos, probe_duration, trim_clip
 
 
 class EpisodeSourceError(RuntimeError):
@@ -110,3 +110,35 @@ def resolve_episode_clip(
 
 def clip_duration(path: Path) -> float:
     return probe_duration(path)
+
+
+def resolve_whole_video(
+    client: AnnotatorClient,
+    root: str,
+    timeline: dict[str, Any],
+    view_key: str,
+    cache_dir: Path,
+) -> tuple[Path, float]:
+    """Download every source file for `view_key` (cached) and, if there's more
+    than one, stitch them into a single local mp4 spanning the view's whole
+    global timeline - so windowing (see pipeline.run_annotate_whole_video)
+    never has to reason about file boundaries, only about time.
+    """
+    segments = timeline.get("views", {}).get(view_key, {}).get("segments", [])
+    if not segments:
+        raise EpisodeSourceError(f"No video segments for view {view_key!r}.")
+
+    local_files = []
+    for seg in segments:
+        src = _cache_path(cache_dir, root, seg["path"])
+        if not src.is_file():
+            client.download_media(root, seg["path"], src)
+        local_files.append(src)
+
+    digest = hashlib.sha1(f"{root}::{view_key}::{[s['path'] for s in segments]}".encode()).hexdigest()[:12]
+    dest = cache_dir / "wholevideo" / f"{digest}.mp4"
+    if not dest.is_file():
+        concat_videos(local_files, dest)
+
+    total = timeline.get("views", {}).get(view_key, {}).get("total")
+    return dest, float(total)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from gemini_annotator.project_builder import apply_episode_annotation
-from gemini_annotator.schema import EpisodeAnnotation, SubtaskChunk
+from gemini_annotator.project_builder import apply_episode_annotation, apply_whole_video_annotation
+from gemini_annotator.schema import DetectedEpisode, EpisodeAnnotation, SubtaskChunk
 
 
 def _empty_project() -> dict:
@@ -99,3 +99,51 @@ def test_apply_episode_annotation_skips_recovery_clip_when_none_flagged():
     )
     apply_episode_annotation(project, annotation, episode_global_start=0.0, episode_global_end=3.0)
     assert _layer(project, "recovery")["clips"] == []
+
+
+def _detected_episodes() -> list[DetectedEpisode]:
+    return [
+        DetectedEpisode(
+            index=0, start_sec=0.0, end_sec=30.0, overall_task="pick up the fork",
+            chunks=[
+                SubtaskChunk(0, 0.0, 15.0, "reach for the fork", atomic_actions=["reach"]),
+                SubtaskChunk(1, 15.0, 30.0, "grasp the fork", atomic_actions=["close gripper"],
+                             is_recovery=True, recovery_from="dropped the fork",
+                             recovery_action="pick the fork back up"),
+            ],
+        ),
+        DetectedEpisode(
+            index=1, start_sec=30.0, end_sec=63.0, overall_task="pick up the carrot",
+            chunks=[SubtaskChunk(0, 30.0, 63.0, "grasp the carrot", atomic_actions=["close gripper"])],
+        ),
+    ]
+
+
+def test_apply_whole_video_annotation_writes_one_main_clip_per_detected_episode():
+    project = _empty_project()
+    counts = apply_whole_video_annotation(project, _detected_episodes(), video_start=0.0, video_end=63.0)
+    assert counts == {"episodes": 2, "main": 2, "subtask": 3, "atomic": 3, "recovery": 1}
+
+    main_layer = _layer(project, "main")
+    assert [c["text"] for c in main_layer["clips"]] == ["pick up the fork", "pick up the carrot"]
+    assert main_layer["clips"][0]["start"] == 0.0
+    assert main_layer["clips"][0]["end"] == 30.0
+    assert main_layer["clips"][1]["start"] == 30.0
+
+    recovery_layer = _layer(project, "recovery")
+    assert len(recovery_layer["clips"]) == 1
+    assert recovery_layer["clips"][0]["start"] == 15.0
+
+
+def test_apply_whole_video_annotation_clears_whole_processed_span_not_just_episode_ranges():
+    project = _empty_project()
+    # Pre-existing clip from a previous run, inside the span about to be reprocessed
+    # but not aligned with any of the new (Gemini-detected) episode boundaries.
+    _layer(project, "main")["clips"].append(
+        {"id": "cl_stale", "start": 5.0, "end": 10.0, "text": "stale label from an earlier run"}
+    )
+
+    apply_whole_video_annotation(project, _detected_episodes(), video_start=0.0, video_end=63.0)
+
+    main_layer = _layer(project, "main")
+    assert "stale label from an earlier run" not in [c["text"] for c in main_layer["clips"]]

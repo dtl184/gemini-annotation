@@ -105,6 +105,59 @@ ELABORATION_SCHEMA: dict[str, Any] = {
 
 
 # --------------------------------------------------------------------------
+# whole-video mode: per-window episode-boundary + subtask detection
+# --------------------------------------------------------------------------
+#
+# For "annotate the whole video" (many LeRobot episodes stitched back-to-back
+# with no metadata trusted, or none available at all - e.g. a raw video),
+# Gemini has to find the episode boundaries itself: an abrupt reset in arm/
+# object position where one demo ends and the next begins. Empirically, this
+# degrades fast with window length - accurate to a fraction of a second over
+# ~90s/3 episodes, but badly wrong (even hallucinating timestamps past the
+# clip's real length) over 150s/5 episodes. So the whole video is processed
+# in short windows (see pipeline.run_annotate_whole_video for the sliding-
+# window/carry-forward logic), and this schema handles ONE window: episode
+# boundaries plus, in the same call, that episode's subtask chunks.
+
+WINDOW_SEGMENTATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "episodes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_sec": {"type": "number"},
+                    "end_sec": {"type": "number"},
+                    "overall_task": {
+                        "type": "string",
+                        "description": "One sentence describing what this episode accomplishes.",
+                    },
+                    "chunks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start_sec": {"type": "number"},
+                                "end_sec": {"type": "number"},
+                                "subtask": {
+                                    "type": "string",
+                                    "description": "Short imperative phrase, e.g. 'pick up the fork'.",
+                                },
+                            },
+                            "required": ["start_sec", "end_sec", "subtask"],
+                        },
+                    },
+                },
+                "required": ["start_sec", "end_sec", "overall_task", "chunks"],
+            },
+        },
+    },
+    "required": ["episodes"],
+}
+
+
+# --------------------------------------------------------------------------
 # result types
 # --------------------------------------------------------------------------
 
@@ -139,6 +192,77 @@ class EpisodeAnnotation:
 
     def as_dict(self) -> dict[str, Any]:
         return {"overall_task": self.overall_task, "chunks": [c.as_dict() for c in self.chunks]}
+
+
+@dataclass
+class DetectedEpisode:
+    index: int
+    start_sec: float  # global (whole-video) seconds
+    end_sec: float
+    overall_task: str
+    chunks: list[SubtaskChunk]
+
+
+def parse_window_segmentation(
+    data: dict[str, Any], *, window_start: float, window_end: float
+) -> list[DetectedEpisode]:
+    """Validate one window's output and shift its (window-local) times onto
+    the whole video's global axis. Chunk indices are unique within this
+    window (0..N-1 across all its episodes combined), matching what
+    apply_elaboration expects - the elaboration call for a window sees the
+    same flattened numbering.
+    """
+    raw_episodes = data.get("episodes")
+    if not isinstance(raw_episodes, list) or not raw_episodes:
+        raise ValueError("Gemini returned no episodes for this window")
+
+    episodes: list[DetectedEpisode] = []
+    chunk_counter = 0
+    for i, raw in enumerate(raw_episodes):
+        try:
+            ep_start = window_start + max(0.0, float(raw["start_sec"]))
+            ep_end = window_start + float(raw["end_sec"])
+            ep_end = min(ep_end, window_end)
+            overall_task = str(raw["overall_task"]).strip()
+            raw_chunks = raw.get("chunks")
+        except (KeyError, TypeError, ValueError) as err:
+            raise ValueError(f"Malformed episode at position {i}: {raw!r}") from err
+        if not overall_task or ep_end <= ep_start or not isinstance(raw_chunks, list) or not raw_chunks:
+            continue  # degenerate episode from the model; drop rather than fail the whole window
+
+        chunks: list[SubtaskChunk] = []
+        for c in raw_chunks:
+            try:
+                c_start = window_start + max(0.0, float(c["start_sec"]))
+                c_end = min(window_start + float(c["end_sec"]), window_end)
+                subtask = str(c["subtask"]).strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not subtask or c_end <= c_start:
+                continue
+            chunks.append(SubtaskChunk(
+                index=chunk_counter, start_sec=round(c_start, 3), end_sec=round(c_end, 3), subtask=subtask,
+            ))
+            chunk_counter += 1
+        if not chunks:
+            continue
+
+        episodes.append(DetectedEpisode(
+            index=len(episodes), start_sec=round(ep_start, 3), end_sec=round(ep_end, 3),
+            overall_task=overall_task, chunks=chunks,
+        ))
+
+    if not episodes:
+        raise ValueError("Every episode Gemini returned for this window was degenerate")
+    episodes.sort(key=lambda e: e.start_sec)
+    return episodes
+
+
+def apply_window_elaboration(episodes: list[DetectedEpisode], data: dict[str, Any]) -> None:
+    """Same merge as apply_elaboration, just over every chunk across every
+    episode in this window (they share one flat 0..N-1 index space)."""
+    all_chunks = [c for ep in episodes for c in ep.chunks]
+    apply_elaboration(all_chunks, data)
 
 
 def parse_segmentation(data: dict[str, Any], *, duration: float) -> tuple[str, list[SubtaskChunk]]:
